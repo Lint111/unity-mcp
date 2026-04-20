@@ -8,10 +8,6 @@ using UnityEditor.Build.Reporting;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Tools.Build;
 
-// Disambiguate from MCPForUnity.Editor.Tools.BatchJob (command-gateway queue job)
-// which sits in the enclosing namespace and would otherwise shadow the build type.
-using BatchJob = MCPForUnity.Editor.Tools.Build.BatchJob;
-
 namespace MCPForUnity.Editor.Tools
 {
     [McpForUnityTool("manage_build", AutoRegister = false, Group = "core",
@@ -459,7 +455,7 @@ namespace MCPForUnity.Editor.Tools
                 }
 
                 string batchId = BuildJobStore.CreateBatchId();
-                var batch = new BatchJob(batchId);
+                var batch = new Build.BatchJob(batchId);
                 batch.State = BuildJobState.Building;
                 BuildJobStore.AddBatchJob(batch);
 
@@ -509,7 +505,7 @@ namespace MCPForUnity.Editor.Tools
                 }
 
                 string batchId = BuildJobStore.CreateBatchId();
-                var batch = new BatchJob(batchId);
+                var batch = new Build.BatchJob(batchId);
                 batch.State = BuildJobState.Building;
                 BuildJobStore.AddBatchJob(batch);
 
