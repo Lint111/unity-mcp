@@ -43,6 +43,10 @@ namespace MCPForUnity.Editor.Tools
                 bool shouldRefresh = string.Equals(mode, "force", StringComparison.OrdinalIgnoreCase)
                                      || string.Equals(mode, "if_dirty", StringComparison.OrdinalIgnoreCase);
 
+                // Drive Unity's main-thread tick at full speed so the queued compile /
+                // import actually runs when the Editor is backgrounded.
+                EditorReadyPump.RequestPump("refresh-unity");
+
                 if (shouldRefresh)
                 {
                     if (string.Equals(scope, "scripts", StringComparison.OrdinalIgnoreCase))

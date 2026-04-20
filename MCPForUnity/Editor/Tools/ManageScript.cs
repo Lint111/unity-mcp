@@ -8,6 +8,7 @@ using UnityEditor;
 using UnityEngine;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services;
 using System.Threading;
 using System.Security.Cryptography;
 
@@ -786,6 +787,7 @@ namespace MCPForUnity.Editor.Tools
                 if (immediate)
                 {
                     McpLog.Info($"[ManageScript] ApplyTextEdits: immediate refresh for '{relativePath}'");
+                    EditorReadyPump.RequestPump("manage-script-apply-edits");
                     AssetDatabase.ImportAsset(
                         relativePath,
                         ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate
@@ -1222,6 +1224,7 @@ namespace MCPForUnity.Editor.Tools
                 bool deleted = AssetDatabase.MoveAssetToTrash(relativePath);
                 if (deleted)
                 {
+                    EditorReadyPump.RequestPump("manage-script-delete");
                     AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
                     return new SuccessResponse(
                         $"Script '{Path.GetFileName(relativePath)}' moved to trash successfully.",
@@ -2971,6 +2974,7 @@ namespace MCPForUnity.Editor.Tools
             {
                 string[] toImport;
                 lock (_lock) { toImport = _paths.ToArray(); _paths.Clear(); }
+                EditorReadyPump.RequestPump("manage-script-debounced-refresh");
                 foreach (var p in toImport)
                 {
                     var sp = ManageScriptRefreshHelpers.SanitizeAssetsPath(p);
@@ -3011,6 +3015,7 @@ namespace MCPForUnity.Editor.Tools
             var sp = SanitizeAssetsPath(relPath);
             var opts = ImportAssetOptions.ForceUpdate;
             if (synchronous) opts |= ImportAssetOptions.ForceSynchronousImport;
+            EditorReadyPump.RequestPump("manage-script-import-compile");
             AssetDatabase.ImportAsset(sp, opts);
 #if UNITY_EDITOR
             UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
