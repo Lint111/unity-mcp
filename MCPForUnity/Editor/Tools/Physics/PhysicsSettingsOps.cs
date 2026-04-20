@@ -59,7 +59,12 @@ namespace MCPForUnity.Editor.Tools.Physics
                         queriesHitTriggers = Physics2D.queriesHitTriggers,
                         queriesStartInColliders = Physics2D.queriesStartInColliders,
                         callbacksOnDisable = Physics2D.callbacksOnDisable,
+                        // Deprecated since Unity 2022; still functional. The replacement
+                        // Physics2D.SyncTransforms() is a one-shot method, not a toggle,
+                        // so there is no drop-in replacement for exposing this setting.
+#pragma warning disable CS0618
                         autoSyncTransforms = Physics2D.autoSyncTransforms
+#pragma warning restore CS0618
                     }
                 };
             }
@@ -281,7 +286,10 @@ namespace MCPForUnity.Editor.Tools.Physics
                         changed.Add("callbacksOnDisable");
                         break;
                     case "autosynctransforms":
+                        // Deprecated since Unity 2022; see note in the getter path above.
+#pragma warning disable CS0618
                         Physics2D.autoSyncTransforms = prop.Value.Value<bool>();
+#pragma warning restore CS0618
                         changed.Add("autoSyncTransforms");
                         break;
                 }
