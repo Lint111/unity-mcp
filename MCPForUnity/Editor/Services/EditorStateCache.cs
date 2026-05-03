@@ -44,6 +44,13 @@ namespace MCPForUnity.Editor.Services
 
         private static JObject _cached;
 
+        // Cached reflection handle for UnityEditor.Compilation.CompilationPipeline.isCompiling.
+        // Resolved lazily on first use and reused for the lifetime of the domain — the type
+        // and property cannot change between domain reloads, and a fresh static ctor runs after
+        // each reload so this resets cleanly without manual invalidation.
+        private static PropertyInfo _compilationPipelineIsCompilingProp;
+        private static bool _compilationPipelineLookupAttempted;
+
         private sealed class EditorStateSnapshot
         {
             [JsonProperty("schema_version")]
@@ -543,26 +550,45 @@ namespace MCPForUnity.Editor.Services
             }
 
             // In Play mode, EditorApplication.isCompiling can have false positives.
-            // Double-check with CompilationPipeline.isCompiling via reflection.
+            // Double-check with CompilationPipeline.isCompiling via the cached PropertyInfo.
             if (EditorApplication.isPlaying)
             {
-                try
+                var prop = ResolveCompilationPipelineIsCompiling();
+                if (prop != null)
                 {
-                    Type pipeline = Type.GetType("UnityEditor.Compilation.CompilationPipeline, UnityEditor");
-                    var prop = pipeline?.GetProperty("isCompiling", BindingFlags.Public | BindingFlags.Static);
-                    if (prop != null)
+                    try { return (bool)prop.GetValue(null); }
+                    catch
                     {
-                        return (bool)prop.GetValue(null);
+                        // If the cached invoke fails (extremely unusual — would mean Unity
+                        // changed the property shape mid-session), fall back below.
                     }
-                }
-                catch
-                {
-                    // If reflection fails, fall back to EditorApplication.isCompiling
                 }
             }
 
             // Outside Play mode or if reflection failed, trust EditorApplication.isCompiling
             return true;
+        }
+
+        private static PropertyInfo ResolveCompilationPipelineIsCompiling()
+        {
+            if (_compilationPipelineLookupAttempted)
+            {
+                return _compilationPipelineIsCompilingProp;
+            }
+
+            try
+            {
+                var pipeline = Type.GetType("UnityEditor.Compilation.CompilationPipeline, UnityEditor");
+                _compilationPipelineIsCompilingProp = pipeline?.GetProperty(
+                    "isCompiling", BindingFlags.Public | BindingFlags.Static);
+            }
+            catch
+            {
+                _compilationPipelineIsCompilingProp = null;
+            }
+
+            _compilationPipelineLookupAttempted = true;
+            return _compilationPipelineIsCompilingProp;
         }
     }
 }
