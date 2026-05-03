@@ -83,80 +83,76 @@ namespace MCPForUnity.Editor.Services
                 return;
             }
 
-            // If the editor is not compiling, attempt an immediate restart without relying on editor focus.
-            bool isCompiling = EditorApplication.isCompiling;
-            try
-            {
-                var pipeline = Type.GetType("UnityEditor.Compilation.CompilationPipeline, UnityEditor");
-                var prop = pipeline?.GetProperty("isCompiling", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                if (prop != null) isCompiling |= (bool)prop.GetValue(null);
-            }
-            catch { }
-
-            if (!isCompiling)
-            {
-                _ = ResumeHttpWithRetriesAsync();
-                return;
-            }
-
-            // Fallback when compiling: schedule on the editor loop
-            EditorApplication.delayCall += () =>
-            {
-                _ = ResumeHttpWithRetriesAsync();
-            };
+            // Fire the resume immediately on a Task.Delay-driven retry schedule.
+            // Do NOT gate this on EditorApplication.delayCall — delayCall waits for
+            // a main-thread tick, which Unity throttles hard while unfocused. The
+            // retry loop (Task.Delay) runs on a timer thread and keeps making
+            // progress regardless of focus state.
+            _ = ResumeHttpWithRetriesAsync();
         }
 
         private static async Task ResumeHttpWithRetriesAsync()
         {
             Exception lastException = null;
 
-            for (int i = 0; i < ResumeRetrySchedule.Length; i++)
+            // Keep Unity ticking at full speed for the duration of the retry schedule
+            // so the StartAsync work (which does hop to the main thread) completes
+            // even if the user has not focused the Editor since the reload.
+            EditorReadyPump.Acquire("http-bridge-reload");
+            try
             {
-                int attempt = i + 1;
-                McpLog.Debug($"[HTTP Reload] Resume attempt {attempt}/{ResumeRetrySchedule.Length}");
-
-                TimeSpan delay = ResumeRetrySchedule[i];
-                if (delay > TimeSpan.Zero)
+                for (int i = 0; i < ResumeRetrySchedule.Length; i++)
                 {
-                    McpLog.Debug($"[HTTP Reload] Waiting {delay.TotalSeconds:0.#}s before resume attempt {attempt}");
-                    try { await Task.Delay(delay); }
-                    catch { return; }
-                }
+                    int attempt = i + 1;
+                    McpLog.Debug($"[HTTP Reload] Resume attempt {attempt}/{ResumeRetrySchedule.Length}");
 
-                // Abort retries if the user switched transports while we were waiting.
-                if (!EditorConfigurationCache.Instance.UseHttpTransport)
-                {
-                    return;
-                }
-
-                try
-                {
-                    bool started = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
-                    if (started)
+                    TimeSpan delay = ResumeRetrySchedule[i];
+                    if (delay > TimeSpan.Zero)
                     {
-                        McpLog.Debug($"[HTTP Reload] Resume succeeded on attempt {attempt}");
-                        MCPForUnityEditorWindow.RequestHealthVerification();
+                        McpLog.Debug($"[HTTP Reload] Waiting {delay.TotalSeconds:0.#}s before resume attempt {attempt}");
+                        try { await Task.Delay(delay); }
+                        catch { return; }
+                    }
+
+                    // Abort retries if the user switched transports while we were waiting.
+                    if (!EditorConfigurationCache.Instance.UseHttpTransport)
+                    {
                         return;
                     }
 
-                    var state = MCPServiceLocator.TransportManager.GetState(TransportMode.Http);
-                    string reason = string.IsNullOrWhiteSpace(state?.Error) ? "no error detail" : state.Error;
-                    McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} failed: {reason}");
-                }
-                catch (Exception ex)
-                {
-                    lastException = ex;
-                    McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} threw: {ex.Message}");
-                }
-            }
+                    try
+                    {
+                        bool started = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
+                        if (started)
+                        {
+                            McpLog.Debug($"[HTTP Reload] Resume succeeded on attempt {attempt}");
+                            MCPForUnityEditorWindow.RequestHealthVerification();
+                            return;
+                        }
 
-            if (lastException != null)
-            {
-                McpLog.Warn($"Failed to resume HTTP MCP bridge after domain reload: {lastException.Message}");
+                        var state = MCPServiceLocator.TransportManager.GetState(TransportMode.Http);
+                        string reason = string.IsNullOrWhiteSpace(state?.Error) ? "no error detail" : state.Error;
+                        McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} failed: {reason}");
+                    }
+                    catch (Exception ex)
+                    {
+                        lastException = ex;
+                        McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} threw: {ex.Message}");
+                    }
+                }
+
+                if (lastException != null)
+                {
+                    McpLog.Warn($"Failed to resume HTTP MCP bridge after domain reload: {lastException.Message}");
+                }
+                else
+                {
+                    McpLog.Warn("Failed to resume HTTP MCP bridge after domain reload");
+                }
             }
-            else
+            finally
             {
-                McpLog.Warn("Failed to resume HTTP MCP bridge after domain reload");
+                EditorReadyPump.Release("http-bridge-reload");
             }
         }
     }

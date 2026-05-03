@@ -101,7 +101,13 @@ namespace MCPForUnity.Editor.Services
             try { EditorApplication.QueuePlayerLoopUpdate(); } catch { }
         }
 
-        private static void Acquire(string reason)
+        /// <summary>
+        /// Manually acquire no-throttle mode. Caller is responsible for matching
+        /// <see cref="Release"/>. Use this when the work has a well-defined end
+        /// (e.g. a reconnect attempt) and you do not want the auto-release-on-idle
+        /// behavior of <see cref="RequestPump"/>.
+        /// </summary>
+        internal static void Acquire(string reason)
         {
             int refCount = SessionState.GetInt(SessionKey_RefCount, 0);
             if (refCount == 0)
@@ -112,7 +118,11 @@ namespace MCPForUnity.Editor.Services
             McpLog.Debug($"[EditorReadyPump] Acquired ({reason}). RefCount={refCount + 1}");
         }
 
-        private static void Release(string reason)
+        /// <summary>
+        /// Release a manual <see cref="Acquire"/>. Restores the user's interaction
+        /// settings once the ref-count drops to zero.
+        /// </summary>
+        internal static void Release(string reason)
         {
             int refCount = SessionState.GetInt(SessionKey_RefCount, 0);
             if (refCount <= 0)
