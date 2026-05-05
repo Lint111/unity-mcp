@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEditorInternal;
 using UnityEditor.TestTools.TestRunner.Api;
@@ -40,6 +41,14 @@ namespace MCPForUnity.Editor.Services
         public List<TestJobFailure> FailuresSoFar { get; set; }
         public string Error { get; set; }
         public TestRunResult Result { get; set; }
+        // Maximal serialized form of Result, persisted to a sidecar JSON in Library/ so it
+        // survives domain reloads. Populated on finalize and lazily reloaded on first access
+        // after a reload via TryLoadResultSidecar. Always stored with includeDetails=true
+        // and includeFailedTests=true; ToSerializable filters down based on caller flags.
+        public JObject CachedSerializedResult { get; set; }
+        // Sentinel: true once we've attempted (and possibly failed) to load the sidecar.
+        // Prevents re-reading from disk on every poll for a job that has no sidecar.
+        public bool SidecarLoadAttempted { get; set; }
         public long InitTimeoutMs { get; set; }
     }
 
@@ -95,6 +104,7 @@ namespace MCPForUnity.Editor.Services
         public static bool ClearStuckJob()
         {
             bool cleared = false;
+            string clearedJobId = null;
             lock (LockObj)
             {
                 if (string.IsNullOrEmpty(_currentJobId))
@@ -111,9 +121,15 @@ namespace MCPForUnity.Editor.Services
                     job.LastUpdateUnixMs = now;
                     McpLog.Warn($"[TestJobManager] Manually cleared stuck job {_currentJobId}");
                     cleared = true;
+                    clearedJobId = _currentJobId;
                 }
 
                 _currentJobId = null;
+            }
+            // A stuck job never produced a result; remove any sidecar so it doesn't leak.
+            if (clearedJobId != null)
+            {
+                DeleteResultSidecar(clearedJobId);
             }
             PersistToSessionState(force: true);
             return cleared;
@@ -142,6 +158,74 @@ namespace MCPForUnity.Editor.Services
             public List<TestJobFailure> failures_so_far { get; set; }
             public string error { get; set; }
             public long init_timeout_ms { get; set; }
+        }
+
+        private static string SidecarToolName(string jobId) => $"TestJobResult_{jobId}";
+
+        /// <summary>
+        /// Persist the maximal serialized form of a finalized job's result to a sidecar JSON
+        /// under Library/. Survives domain reloads so agents polling get_test_job after a
+        /// reload (e.g., triggered by a script edit between completion and the poll) still
+        /// receive the full summary instead of result=null.
+        /// </summary>
+        private static void PersistResultSidecar(TestJob job)
+        {
+            if (job?.Result == null || string.IsNullOrEmpty(job.JobId))
+            {
+                return;
+            }
+
+            try
+            {
+                // Serialize once at the maximal level; ToSerializable filters per-caller.
+                var serializable = job.Result.ToSerializable(job.Mode, includeDetails: true, includeFailedTests: true);
+                var asToken = JToken.FromObject(serializable);
+                if (asToken is JObject asObject)
+                {
+                    job.CachedSerializedResult = asObject;
+                    job.SidecarLoadAttempted = true;
+                    McpJobStateStore.SaveState(SidecarToolName(job.JobId), asObject);
+                }
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[TestJobManager] Failed to persist result sidecar for {job.JobId}: {ex.Message}");
+            }
+        }
+
+        private static JObject TryLoadResultSidecar(string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId))
+            {
+                return null;
+            }
+
+            try
+            {
+                return McpJobStateStore.LoadState<JObject>(SidecarToolName(jobId));
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[TestJobManager] Failed to load result sidecar for {jobId}: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static void DeleteResultSidecar(string jobId)
+        {
+            if (string.IsNullOrEmpty(jobId))
+            {
+                return;
+            }
+
+            try
+            {
+                McpJobStateStore.ClearState(SidecarToolName(jobId));
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[TestJobManager] Failed to delete result sidecar for {jobId}: {ex.Message}");
+            }
         }
 
         private static TestJobStatus ParseStatus(string status)
@@ -225,11 +309,17 @@ namespace MCPForUnity.Editor.Services
                         {
                             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                             long staleCutoffMs = 60 * 1000; // 60 seconds
-                            if (now - currentJob.LastUpdateUnixMs > staleCutoffMs)
+                            long elapsedMs = now - currentJob.LastUpdateUnixMs;
+                            if (elapsedMs > staleCutoffMs)
                             {
-                                McpLog.Warn($"[TestJobManager] Clearing stale job {_currentJobId} (last update {(now - currentJob.LastUpdateUnixMs) / 1000}s ago)");
+                                McpLog.Warn($"[TestJobManager] Clearing stale job {_currentJobId} (last update {elapsedMs / 1000}s ago)");
                                 currentJob.Status = TestJobStatus.Failed;
-                                currentJob.Error = "Job orphaned after domain reload";
+                                // Distinguish "domain reload happened mid-run" from generic
+                                // orphaning. A run that had started (TotalTests known) but
+                                // never finished is the canonical reload-killed case.
+                                currentJob.Error = currentJob.TotalTests.HasValue
+                                    ? "Job orphaned by domain reload mid-run; rerun the test"
+                                    : "Job orphaned after domain reload (never initialized)";
                                 currentJob.FinishedUnixMs = now;
                                 _currentJobId = null;
                             }
@@ -257,10 +347,29 @@ namespace MCPForUnity.Editor.Services
             try
             {
                 PersistedState snapshot;
+                List<string> evictedJobIds = null;
                 lock (LockObj)
                 {
-                    var jobs = Jobs.Values
+                    var ordered = Jobs.Values
                         .OrderByDescending(j => j.LastUpdateUnixMs)
+                        .ToList();
+
+                    if (ordered.Count > MaxJobsToKeep)
+                    {
+                        evictedJobIds = ordered
+                            .Skip(MaxJobsToKeep)
+                            .Where(j => !string.IsNullOrEmpty(j.JobId))
+                            .Select(j => j.JobId)
+                            .ToList();
+                        // Drop in-memory state for evicted jobs as well so polling them
+                        // returns "Unknown job_id" rather than a stale half-state.
+                        foreach (var id in evictedJobIds)
+                        {
+                            Jobs.Remove(id);
+                        }
+                    }
+
+                    var jobs = ordered
                         .Take(MaxJobsToKeep)
                         .Select(j => new PersistedJob
                         {
@@ -287,6 +396,14 @@ namespace MCPForUnity.Editor.Services
                         current_job_id = _currentJobId,
                         jobs = jobs
                     };
+                }
+
+                if (evictedJobIds != null)
+                {
+                    foreach (var id in evictedJobIds)
+                    {
+                        DeleteResultSidecar(id);
+                    }
                 }
 
                 SessionState.SetString(SessionKeyCurrentJobId, snapshot.current_job_id ?? string.Empty);
@@ -367,6 +484,7 @@ namespace MCPForUnity.Editor.Services
         public static void FinalizeCurrentJobFromRunFinished(TestRunResult resultPayload)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            TestJob finalized = null;
             lock (LockObj)
             {
                 if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
@@ -383,7 +501,9 @@ namespace MCPForUnity.Editor.Services
                 job.Result = resultPayload;
                 job.CurrentTestFullName = null;
                 _currentJobId = null;
+                finalized = job;
             }
+            PersistResultSidecar(finalized);
             PersistToSessionState(force: true);
         }
 
@@ -539,9 +659,29 @@ namespace MCPForUnity.Editor.Services
             }
 
             object resultPayload = null;
-            if (job.Status == TestJobStatus.Succeeded && job.Result != null)
+            bool isFinalized = job.Status == TestJobStatus.Succeeded || job.Status == TestJobStatus.Failed;
+            if (job.Result != null)
             {
+                // Hot path: in-memory result available (job finalized in this domain reload epoch).
                 resultPayload = job.Result.ToSerializable(job.Mode, includeDetails, includeFailedTests);
+            }
+            else if (isFinalized)
+            {
+                // Cold path: in-memory Result was lost (e.g., domain reload between finalize and
+                // poll). Lazily load the sidecar JSON written at finalize time.
+                lock (LockObj)
+                {
+                    if (job.CachedSerializedResult == null && !job.SidecarLoadAttempted)
+                    {
+                        job.CachedSerializedResult = TryLoadResultSidecar(job.JobId);
+                        job.SidecarLoadAttempted = true;
+                    }
+                }
+
+                if (job.CachedSerializedResult != null)
+                {
+                    resultPayload = FilterCachedResult(job.CachedSerializedResult, includeDetails, includeFailedTests);
+                }
             }
 
             return new
@@ -618,6 +758,41 @@ namespace MCPForUnity.Editor.Services
             return (now - job.CurrentTestStartedUnixMs.Value) > StuckThresholdMs;
         }
 
+        /// <summary>
+        /// Apply the same includeDetails/includeFailedTests filtering that
+        /// <see cref="TestRunResult.ToSerializable"/> applies, but to a previously-serialized
+        /// JObject loaded from a sidecar. Sidecars are always written at the maximal level.
+        /// </summary>
+        private static JObject FilterCachedResult(JObject cached, bool includeDetails, bool includeFailedTests)
+        {
+            if (cached == null)
+            {
+                return null;
+            }
+
+            // Clone so we don't mutate the cached copy that other callers may share.
+            var copy = (JObject)cached.DeepClone();
+            if (includeDetails)
+            {
+                return copy; // Include all results.
+            }
+
+            if (copy["results"] is JArray arr)
+            {
+                if (includeFailedTests)
+                {
+                    var filtered = new JArray(arr.Where(r =>
+                        !string.Equals(r?["state"]?.ToString(), "Passed", StringComparison.OrdinalIgnoreCase)));
+                    copy["results"] = filtered;
+                }
+                else
+                {
+                    copy["results"] = null;
+                }
+            }
+            return copy;
+        }
+
         private static object[] BuildFailuresPayload(List<TestJobFailure> failures)
         {
             if (failures == null || failures.Count == 0)
@@ -636,6 +811,7 @@ namespace MCPForUnity.Editor.Services
 
         private static void FinalizeFromTask(string jobId, Task<TestRunResult> task)
         {
+            TestJob finalized = null;
             lock (LockObj)
             {
                 if (!Jobs.TryGetValue(jobId, out var existing))
@@ -680,7 +856,9 @@ namespace MCPForUnity.Editor.Services
                 {
                     _currentJobId = null;
                 }
+                finalized = existing;
             }
+            PersistResultSidecar(finalized);
             PersistToSessionState(force: true);
         }
     }
