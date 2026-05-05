@@ -254,3 +254,161 @@ def test_cancel_without_job_id_sends_minimal_params(mock_unity):
 def test_sends_to_correct_tool_name(mock_unity):
     asyncio.run(manage_build(SimpleNamespace(), action="status"))
     assert mock_unity["tool_name"] == "manage_build"
+
+
+# ── wait_timeout long-poll behavior ─────────────────────────────────
+
+
+def _wait_mock(monkeypatch, response_sequence):
+    """Replace transport with a sequence-driven fake. Returns the call counter."""
+    state = {"calls": 0, "params_log": []}
+
+    async def fake_send(send_fn, unity_instance, tool_name, params):
+        state["params_log"].append(dict(params))
+        idx = min(state["calls"], len(response_sequence) - 1)
+        state["calls"] += 1
+        return response_sequence[idx]
+
+    monkeypatch.setattr(
+        "services.tools.manage_build.get_unity_instance_from_context",
+        AsyncMock(return_value="unity-instance-1"),
+    )
+    monkeypatch.setattr(
+        "services.tools.manage_build.send_with_unity_instance",
+        fake_send,
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_returns_terminal_response(monkeypatch):
+    state = _wait_mock(
+        monkeypatch,
+        [
+            {"_mcp_status": "pending", "data": {"job_id": "build-1"}},
+            {"_mcp_status": "pending", "data": {"job_id": "build-1"}},
+            {"success": True, "data": {"status": "succeeded", "job_id": "build-1"}},
+        ],
+    )
+
+    result = await manage_build(
+        SimpleNamespace(), action="build", target="windows64", wait_timeout=5
+    )
+
+    # Returns the terminal (non-pending) payload, not the initial pending one.
+    assert result.get("_mcp_status") != "pending"
+    assert result["data"]["status"] == "succeeded"
+    # First call is the kickoff (action=build); subsequent calls are status polls.
+    assert state["params_log"][0]["action"] == "build"
+    assert state["params_log"][1]["action"] == "status"
+    assert state["params_log"][1]["job_id"] == "build-1"
+    assert state["calls"] == 3
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_returns_pending_on_timeout(monkeypatch):
+    _wait_mock(
+        monkeypatch,
+        [{"_mcp_status": "pending", "data": {"job_id": "build-2", "phase": "compiling"}}],
+    )
+
+    result = await manage_build(
+        SimpleNamespace(), action="build", target="windows64", wait_timeout=1
+    )
+
+    assert result["_mcp_status"] == "pending"
+    assert result["data"]["phase"] == "compiling"
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_skipped_when_response_already_terminal(monkeypatch):
+    state = _wait_mock(
+        monkeypatch,
+        [{"success": True, "message": "Build profile activated.", "data": {}}],
+    )
+
+    result = await manage_build(
+        SimpleNamespace(), action="profiles", activate="true",
+        profile="Assets/profile.asset", wait_timeout=30,
+    )
+
+    # Single round-trip — no status polls because nothing is pending.
+    assert state["calls"] == 1
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_zero_skips_wait_loop(monkeypatch):
+    state = _wait_mock(
+        monkeypatch,
+        [{"_mcp_status": "pending", "data": {"job_id": "build-3"}}],
+    )
+
+    result = await manage_build(
+        SimpleNamespace(), action="build", target="windows64", wait_timeout=0
+    )
+
+    assert state["calls"] == 1  # no polling loop
+    assert result["_mcp_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_negative_returns_validation_error(monkeypatch):
+    _wait_mock(monkeypatch, [{"success": True}])
+
+    result = await manage_build(
+        SimpleNamespace(), action="build", target="windows64", wait_timeout=-5
+    )
+
+    assert result["success"] is False
+    assert "wait_timeout" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_uses_provided_job_id_when_no_data(monkeypatch):
+    """If kickoff payload has no data.job_id but caller provided one, use it."""
+    state = _wait_mock(
+        monkeypatch,
+        [
+            {"_mcp_status": "pending"},  # no data.job_id
+            {"success": True, "data": {"status": "succeeded"}},
+        ],
+    )
+
+    result = await manage_build(
+        SimpleNamespace(), action="status", job_id="build-existing", wait_timeout=5
+    )
+
+    assert state["params_log"][0]["action"] == "status"
+    assert state["params_log"][1]["job_id"] == "build-existing"
+    assert result["data"]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_returns_pending_when_no_addressable_job(monkeypatch):
+    """If the kickoff is pending but no job_id is available anywhere, return as-is."""
+    state = _wait_mock(
+        monkeypatch, [{"_mcp_status": "pending", "data": "not-a-dict"}],
+    )
+
+    result = await manage_build(
+        SimpleNamespace(), action="build", target="windows64", wait_timeout=5
+    )
+
+    assert state["calls"] == 1  # cannot poll without a job_id
+    assert result["_mcp_status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_build_wait_timeout_cancels_cleanly(monkeypatch):
+    _wait_mock(monkeypatch, [{"_mcp_status": "pending", "data": {"job_id": "x"}}])
+
+    task = asyncio.create_task(
+        manage_build(
+            SimpleNamespace(), action="build", target="windows64", wait_timeout=60
+        )
+    )
+    await asyncio.sleep(0.1)  # let it enter the wait loop
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

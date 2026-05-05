@@ -7,6 +7,7 @@ from mcp.types import ToolAnnotations
 
 from services.registry import mcp_for_unity_tool
 from services.tools import get_unity_instance_from_context
+from services.tools._wait import wait_for_async_job
 from services.tools.utils import coerce_bool, parse_json_payload
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
@@ -65,12 +66,25 @@ async def manage_build(
     profiles: Annotated[Optional[str], "JSON array of profile paths for batch build (Unity 6+)"] = None,
     output_dir: Annotated[Optional[str], "Base output directory for batch builds"] = None,
     job_id: Annotated[Optional[str], "Job ID for status/cancel"] = None,
+    wait_timeout: Annotated[
+        Optional[int],
+        "If set, wait up to this many seconds for the build/batch to reach a terminal "
+        "state before returning. Avoids client-side poll loops. Recommended: 600 for "
+        "normal player builds, longer for IL2CPP / batch. Returns immediately when "
+        "tests complete sooner; returns last status on timeout.",
+    ] = None,
 ) -> dict[str, Any]:
     action_lower = action.lower()
     if action_lower not in ALL_ACTIONS:
         return {
             "success": False,
             "message": f"Unknown action '{action}'. Valid actions: {', '.join(ALL_ACTIONS)}",
+        }
+
+    if wait_timeout is not None and wait_timeout < 0:
+        return {
+            "success": False,
+            "message": "wait_timeout must be a non-negative integer (seconds) or None",
         }
 
     params_dict: dict[str, Any] = {"action": action_lower}
@@ -107,4 +121,30 @@ async def manage_build(
         if val is not None:
             params_dict[key] = val
 
-    return await _send_build_command(ctx, params_dict)
+    response = await _send_build_command(ctx, params_dict)
+
+    if not wait_timeout or wait_timeout <= 0:
+        return response
+    if not isinstance(response, dict) or response.get("_mcp_status") != "pending":
+        return response  # not a kicked-off async job; nothing to wait on
+
+    # Resolve a job_id we can poll: callers may pass one for status/cancel,
+    # otherwise the kickoff response carries it under data.job_id.
+    resolved_job_id = job_id or (
+        (response.get("data") or {}).get("job_id")
+        if isinstance(response.get("data"), dict)
+        else None
+    )
+    if not resolved_job_id:
+        return response  # nothing addressable to poll
+
+    async def _fetch_status() -> dict[str, Any]:
+        return await _send_build_command(
+            ctx, {"action": "status", "job_id": resolved_job_id})
+
+    return await wait_for_async_job(
+        fetch_status=_fetch_status,
+        timeout_seconds=wait_timeout,
+        initial_interval=1.0,
+        max_interval=5.0,
+    )

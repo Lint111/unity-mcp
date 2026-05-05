@@ -152,6 +152,136 @@ class TestManagePackagesToolValidation:
 
 
 # =============================================================================
+# wait_timeout long-poll behavior
+# =============================================================================
+
+class TestManagePackagesWaitTimeout:
+    """Server-side long-poll for package add/remove/embed jobs."""
+
+    @staticmethod
+    def _ctx():
+        ctx = MagicMock()
+        ctx.get_state = AsyncMock(return_value=None)
+        return ctx
+
+    def test_wait_timeout_returns_terminal_response(self):
+        """Polls until the C# side stops returning _mcp_status=pending."""
+        from services.tools.manage_packages import manage_packages
+
+        sequence = [
+            {"_mcp_status": "pending", "data": {"job_id": "pkg-1"}},
+            {"_mcp_status": "pending", "data": {"job_id": "pkg-1"}},
+            {"success": True, "message": "Job pkg-1 succeeded.",
+             "data": {"job_id": "pkg-1", "status": "succeeded"}},
+        ]
+        call_log: list[dict] = []
+
+        async def fake_send(ctx, params):
+            call_log.append(dict(params))
+            return sequence[min(len(call_log) - 1, len(sequence) - 1)]
+
+        with patch(
+            "services.tools.manage_packages._send_packages_command",
+            new=fake_send,
+        ):
+            result = asyncio.run(manage_packages(
+                self._ctx(),
+                action="add_package",
+                package="com.unity.timeline",
+                wait_timeout=5,
+            ))
+
+        assert result["success"] is True
+        assert result["data"]["status"] == "succeeded"
+        # Kickoff (action=add_package) followed by status polls.
+        assert call_log[0]["action"] == "add_package"
+        assert call_log[1]["action"] == "status"
+        assert call_log[1]["job_id"] == "pkg-1"
+        assert len(call_log) == 3
+
+    def test_wait_timeout_returns_pending_on_timeout(self):
+        from services.tools.manage_packages import manage_packages
+
+        async def fake_send(ctx, params):
+            return {"_mcp_status": "pending", "data": {"job_id": "pkg-2"}}
+
+        with patch(
+            "services.tools.manage_packages._send_packages_command",
+            new=fake_send,
+        ):
+            result = asyncio.run(manage_packages(
+                self._ctx(),
+                action="add_package",
+                package="com.example",
+                wait_timeout=1,
+            ))
+
+        assert result["_mcp_status"] == "pending"
+
+    def test_wait_timeout_zero_skips_loop(self):
+        from services.tools.manage_packages import manage_packages
+
+        call_log: list[dict] = []
+
+        async def fake_send(ctx, params):
+            call_log.append(dict(params))
+            return {"_mcp_status": "pending", "data": {"job_id": "pkg-3"}}
+
+        with patch(
+            "services.tools.manage_packages._send_packages_command",
+            new=fake_send,
+        ):
+            result = asyncio.run(manage_packages(
+                self._ctx(),
+                action="add_package",
+                package="com.example",
+                wait_timeout=0,
+            ))
+
+        assert len(call_log) == 1
+        assert result["_mcp_status"] == "pending"
+
+    def test_wait_timeout_negative_returns_validation_error(self):
+        from services.tools.manage_packages import manage_packages
+
+        with patch(
+            "services.tools.manage_packages._send_packages_command",
+            new_callable=AsyncMock,
+        ) as mock_send:
+            result = asyncio.run(manage_packages(
+                self._ctx(),
+                action="add_package",
+                package="com.example",
+                wait_timeout=-1,
+            ))
+
+        assert result["success"] is False
+        assert "wait_timeout" in result["message"]
+        mock_send.assert_not_called()
+
+    def test_wait_timeout_skipped_for_terminal_response(self):
+        """Read-only actions never produce _mcp_status=pending — pass through."""
+        from services.tools.manage_packages import manage_packages
+
+        call_log: list[dict] = []
+
+        async def fake_send(ctx, params):
+            call_log.append(dict(params))
+            return {"success": True, "data": {"packages": []}}
+
+        with patch(
+            "services.tools.manage_packages._send_packages_command",
+            new=fake_send,
+        ):
+            result = asyncio.run(manage_packages(
+                self._ctx(), action="list_packages", wait_timeout=10,
+            ))
+
+        assert result["success"] is True
+        assert len(call_log) == 1  # no status poll
+
+
+# =============================================================================
 # CLI Command Parameter Building
 # =============================================================================
 
