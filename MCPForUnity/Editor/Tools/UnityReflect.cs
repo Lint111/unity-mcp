@@ -6,6 +6,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 
@@ -98,8 +99,8 @@ namespace MCPForUnity.Editor.Tools
 
         public static object HandleCommand(JObject @params)
         {
-            if (EditorApplication.isCompiling)
-                return new ErrorResponse("Cannot reflect while Unity is compiling. Wait for domain reload to complete.");
+            if (EditorStateCache.IsEditorBusy())
+                return new ErrorResponse("Cannot reflect while Unity is busy (compiling, importing assets, or running tests). Wait for the editor to settle.");
 
             if (@params == null)
                 return new ErrorResponse("Parameters cannot be null.");

@@ -25,10 +25,12 @@ namespace MCPForUnity.Editor.Tools
             if (!string.IsNullOrEmpty(json))
                 Queue.RestoreFromJson(json);
 
+            // Route through EditorStateCache so all "is editor busy?" callers share
+            // the same definition (compilation, asset import, domain reload pending,
+            // test runs). Test job tracking is queue-specific and stays local.
             Queue.IsEditorBusy = () =>
                 TestJobManager.HasRunningJob
-                || TestRunStatus.IsRunning
-                || EditorApplication.isCompiling;
+                || EditorStateCache.IsEditorBusy();
 
             // Persist before next domain reload
             AssemblyReloadEvents.beforeAssemblyReload += () =>

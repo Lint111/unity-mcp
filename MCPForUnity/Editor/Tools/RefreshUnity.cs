@@ -133,40 +133,58 @@ namespace MCPForUnity.Editor.Tools
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             var start = DateTime.UtcNow;
 
-            void Tick()
+            // Event-driven readiness: Unity raises CompilationPipeline.compilationFinished
+            // and AssemblyReloadEvents.afterAssemblyReload at the moment those phases end,
+            // so we don't have to wait for the next throttled EditorApplication.update tick
+            // (which can be tens of ms apart when the editor is backgrounded). The update
+            // tick remains as a fallback for asset-import completion (which has no event)
+            // and as the timeout watchdog.
+            Action update = null;
+            Action<object> onCompilationFinished = null;
+            Action onAfterAssemblyReload = null;
+
+            void Cleanup()
+            {
+                EditorApplication.update -= update;
+                CompilationPipeline.compilationFinished -= onCompilationFinished;
+                AssemblyReloadEvents.afterAssemblyReload -= onAfterAssemblyReload;
+            }
+
+            void CheckReady()
             {
                 try
                 {
-                    if (tcs.Task.IsCompleted)
-                    {
-                        EditorApplication.update -= Tick;
-                        return;
-                    }
+                    if (tcs.Task.IsCompleted) { Cleanup(); return; }
 
                     if ((DateTime.UtcNow - start) > timeout)
                     {
-                        EditorApplication.update -= Tick;
+                        Cleanup();
                         tcs.TrySetException(new TimeoutException());
                         return;
                     }
 
-                    if (!EditorApplication.isCompiling
-                        && !EditorApplication.isUpdating
-                        && !TestRunStatus.IsRunning
-                        && !EditorApplication.isPlayingOrWillChangePlaymode)
+                    if (!EditorStateCache.IsEditorBusy()
+                        && !EditorStateCache.IsPlayModeActive())
                     {
-                        EditorApplication.update -= Tick;
+                        Cleanup();
                         tcs.TrySetResult(true);
                     }
                 }
                 catch (Exception ex)
                 {
-                    EditorApplication.update -= Tick;
+                    Cleanup();
                     tcs.TrySetException(ex);
                 }
             }
 
-            EditorApplication.update += Tick;
+            update = CheckReady;
+            onCompilationFinished = _ => CheckReady();
+            onAfterAssemblyReload = CheckReady;
+
+            EditorApplication.update += update;
+            CompilationPipeline.compilationFinished += onCompilationFinished;
+            AssemblyReloadEvents.afterAssemblyReload += onAfterAssemblyReload;
+
             // Nudge Unity to pump once in case update is throttled.
             try { EditorApplication.QueuePlayerLoopUpdate(); } catch { }
             return tcs.Task;
