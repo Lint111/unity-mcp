@@ -41,10 +41,21 @@ async def wait_for_editor_ready(ctx: Context, timeout_s: float = 30.0) -> tuple[
     if _in_pytest():
         return (True, 0.0)
 
+    from services.tools.preflight import _resolve_cache_key
+    from services.state.editor_state_cache import get_cached_editor_state, invalidate
+
     start = time.monotonic()
+    # Adaptive sleep: 50ms → 500ms cap, doubling each iteration. Keeps the
+    # fast-settle path snappy while bounding chatter on slow domain reloads.
+    sleep_s = 0.05
+    cache_key = await _resolve_cache_key(ctx)
     while time.monotonic() - start < timeout_s:
         try:
-            state_resp = await editor_state.get_editor_state(ctx)
+            state_resp = await get_cached_editor_state(
+                key=cache_key,
+                fetch_fn=lambda: editor_state.get_editor_state(ctx),
+                ttl_seconds=0.25,
+            )
             state = state_resp.model_dump() if hasattr(state_resp, "model_dump") else state_resp
             data = (state or {}).get("data") if isinstance(state, dict) else None
             advice = (data or {}).get("advice") if isinstance(data, dict) else None
@@ -55,8 +66,11 @@ async def wait_for_editor_ready(ctx: Context, timeout_s: float = 30.0) -> tuple[
                 if not (blocking & _REAL_BLOCKING_REASONS):
                     return (True, time.monotonic() - start)
         except Exception:
-            pass  # not ready yet — keep polling
-        await asyncio.sleep(0.25)
+            # Drop the cached entry so the next iteration re-fetches instead of
+            # serving the same stale failure.
+            invalidate(cache_key)
+        await asyncio.sleep(sleep_s)
+        sleep_s = min(0.5, sleep_s * 2)
 
     return (False, time.monotonic() - start)
 
