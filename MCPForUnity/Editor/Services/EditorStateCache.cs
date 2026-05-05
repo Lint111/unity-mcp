@@ -4,6 +4,7 @@ using MCPForUnity.Editor.Helpers;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
+using UnityEditor.Compilation;
 using UnityEditorInternal;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -40,6 +41,7 @@ namespace MCPForUnity.Editor.Services
         private static bool _lastTrackedIsPaused;
         private static bool _lastTrackedIsUpdating;
         private static bool _lastTrackedTestsRunning;
+        private static bool _lastTrackedSceneIsDirty;
         private static string _lastTrackedActivityPhase;
 
         private static JObject _cached;
@@ -139,6 +141,9 @@ namespace MCPForUnity.Editor.Services
 
             [JsonProperty("name")]
             public string Name { get; set; }
+
+            [JsonProperty("is_dirty")]
+            public bool? IsDirty { get; set; }
         }
 
         private sealed class EditorStateActivity
@@ -266,6 +271,12 @@ namespace MCPForUnity.Editor.Services
                 EditorApplication.update += OnUpdate;
                 EditorApplication.playModeStateChanged += _ => ForceUpdate("playmode");
 
+                // Compilation: edge-trigger the snapshot the moment Unity tells us, instead of
+                // waiting for OnUpdate's 1s throttle to catch the change. compilationStarted is
+                // dispatched before isCompiling flips visibly to most callers.
+                CompilationPipeline.compilationStarted += _ => ForceUpdate("compilation_started");
+                CompilationPipeline.compilationFinished += _ => ForceUpdate("compilation_finished");
+
                 AssemblyReloadEvents.beforeAssemblyReload += () =>
                 {
                     _domainReloadPending = true;
@@ -277,6 +288,21 @@ namespace MCPForUnity.Editor.Services
                     _domainReloadPending = false;
                     _domainReloadAfterUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                     ForceUpdate("after_domain_reload");
+                };
+
+                // Scene lifecycle: keep active_scene metadata fresh without relying on the tick.
+                EditorSceneManager.sceneOpened += (_, _) => ForceUpdate("scene_opened");
+                EditorSceneManager.sceneClosed += _ => ForceUpdate("scene_closed");
+                EditorSceneManager.activeSceneChangedInEditMode += (_, _) =>
+                    ForceUpdate("active_scene_changed");
+                EditorSceneManager.sceneSaved += _ => ForceUpdate("scene_saved");
+
+                // Hierarchy/undo: cheap signal that the scene's dirty bit may have flipped.
+                EditorApplication.hierarchyChanged += () => ForceUpdate("hierarchy_changed");
+                Undo.postprocessModifications += mods =>
+                {
+                    ForceUpdate("undo_postprocess");
+                    return mods;
                 };
             }
             catch (Exception ex)
@@ -306,6 +332,7 @@ namespace MCPForUnity.Editor.Services
             var scene = EditorSceneManager.GetActiveScene();
             string scenePath = string.IsNullOrEmpty(scene.path) ? null : scene.path;
             string sceneName = scene.name ?? string.Empty;
+            bool sceneIsDirty = scene.IsValid() && scene.isDirty;
             bool isFocused = InternalEditorUtility.isApplicationActive;
             bool isPlaying = EditorApplication.isPlaying;
             bool isPaused = EditorApplication.isPaused;
@@ -337,6 +364,7 @@ namespace MCPForUnity.Editor.Services
             bool hasChanges = compilationEdge
                 || _lastTrackedScenePath != scenePath
                 || _lastTrackedSceneName != sceneName
+                || _lastTrackedSceneIsDirty != sceneIsDirty
                 || _lastTrackedIsFocused != isFocused
                 || _lastTrackedIsPlaying != isPlaying
                 || _lastTrackedIsPaused != isPaused
@@ -354,6 +382,7 @@ namespace MCPForUnity.Editor.Services
             // Update tracked state
             _lastTrackedScenePath = scenePath;
             _lastTrackedSceneName = sceneName;
+            _lastTrackedSceneIsDirty = sceneIsDirty;
             _lastTrackedIsFocused = isFocused;
             _lastTrackedIsPlaying = isPlaying;
             _lastTrackedIsPaused = isPaused;
@@ -446,7 +475,8 @@ namespace MCPForUnity.Editor.Services
                     {
                         Path = scenePath,
                         Guid = sceneGuid,
-                        Name = scene.name ?? string.Empty
+                        Name = scene.name ?? string.Empty,
+                        IsDirty = scene.IsValid() ? scene.isDirty : (bool?)null
                     }
                 },
                 Activity = new EditorStateActivity
@@ -534,6 +564,34 @@ namespace MCPForUnity.Editor.Services
 
                 return clone;
             }
+        }
+
+        /// <summary>
+        /// Single source of truth for "should this MCP call be deferred because the editor is
+        /// transient": compiling, asset-importing, mid-domain-reload, or running tests. Reads
+        /// from the cached compilation flag (kept current via CompilationPipeline events) and
+        /// the live <see cref="EditorApplication.isUpdating"/> flag (which has no event).
+        /// Callers should prefer this over hand-rolled checks so the busy semantics stay
+        /// consistent across the codebase.
+        /// </summary>
+        public static bool IsEditorBusy()
+        {
+            // _lastIsCompiling is updated via the CompilationPipeline events / OnUpdate path
+            // and survives Play-mode false positives via GetActualIsCompiling.
+            return _lastIsCompiling
+                || EditorApplication.isUpdating
+                || _domainReloadPending
+                || TestRunStatus.IsRunning;
+        }
+
+        /// <summary>
+        /// True when Unity is in or transitioning to play mode. Wraps
+        /// <see cref="EditorApplication.isPlayingOrWillChangePlaymode"/> for parity with
+        /// <see cref="IsEditorBusy"/> when callers want to gate on both.
+        /// </summary>
+        public static bool IsPlayModeActive()
+        {
+            return EditorApplication.isPlayingOrWillChangePlaymode;
         }
 
         /// <summary>
