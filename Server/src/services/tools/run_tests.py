@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from models import MCPResponse
 from services.registry import mcp_for_unity_tool
 from services.tools import get_unity_instance_from_context
+from services.tools._wait import wait_for_async_job
 from services.tools.preflight import preflight
 import transport.unity_transport as unity_transport
 from transport.legacy.unity_connection import async_send_command_with_retry
@@ -258,69 +259,70 @@ async def get_test_job(
 
     # If wait_timeout is specified, poll server-side until complete or timeout
     if wait_timeout and wait_timeout > 0:
-        deadline = asyncio.get_event_loop().time() + wait_timeout
-        poll_interval = 2.0  # Poll Unity every 2 seconds
-        prev_last_update_unix_ms = None
+        # Project path is resolved lazily on first nudge (registry may not be
+        # ready yet at the start of the wait).
+        project_path_box: dict[str, str | None] = {"value": None}
+        prev_last_update_box: dict[str, Any] = {"value": None}
+        # Try once eagerly so the common case avoids a second resolution.
+        project_path_box["value"] = await _get_unity_project_path(unity_instance)
 
-        # Get project path once for focus nudging (multi-instance support)
-        project_path = await _get_unity_project_path(unity_instance)
+        def _is_terminal(resp: Any) -> bool:
+            # Treat transport failures and unsuccessful payloads as terminal:
+            # there's nothing useful to keep polling against.
+            if not isinstance(resp, dict):
+                return True
+            if not resp.get("success", True):
+                return True
+            data = resp.get("data") or {}
+            return data.get("status", "") in ("succeeded", "failed", "cancelled")
 
-        while True:
-            response = await _fetch_status()
-
-            if not isinstance(response, dict):
-                return MCPResponse(success=False, error=str(response))
-
-            if not response.get("success", True):
-                return MCPResponse(**response)
-
-            # Check if tests are done
-            data = response.get("data", {})
+        async def _on_each_response(resp: Any) -> None:
+            if not isinstance(resp, dict):
+                return
+            data = resp.get("data") or {}
             status = data.get("status", "")
-            if status in ("succeeded", "failed", "cancelled"):
-                return GetTestJobResponse(**response)
+            if status not in ("running",):
+                # Only running jobs need nudging / progress tracking.
+                return
 
-            # Detect progress and reset exponential backoff
             last_update_unix_ms = data.get("last_update_unix_ms")
-            if prev_last_update_unix_ms is not None and last_update_unix_ms != prev_last_update_unix_ms:
-                # Progress detected - reset exponential backoff for next potential stall
+            prev = prev_last_update_box["value"]
+            if prev is not None and last_update_unix_ms != prev:
                 reset_nudge_backoff()
                 logger.debug(f"Test job {job_id} made progress - reset nudge backoff")
-            prev_last_update_unix_ms = last_update_unix_ms
+            prev_last_update_box["value"] = last_update_unix_ms
 
-            # Check if Unity needs a focus nudge to make progress
-            # This handles OS-level throttling (e.g., macOS App Nap) that can
-            # stall PlayMode tests when Unity is in the background.
-            # Uses exponential backoff: 1s, 2s, 4s, 8s, 10s max between nudges.
             progress = data.get("progress") or {}
             editor_is_focused = progress.get("editor_is_focused", True)
             current_time_ms = int(time.time() * 1000)
-
             if should_nudge(
                 status=status,
                 editor_is_focused=editor_is_focused,
                 last_update_unix_ms=last_update_unix_ms,
                 current_time_ms=current_time_ms,
-                # Use default stall_threshold_ms (3s)
             ):
-                logger.info(f"Test job {job_id} appears stalled (unfocused Unity), attempting nudge...")
-                # Lazily resolve project path if not yet available (registry may have become ready)
-                if project_path is None:
-                    project_path = await _get_unity_project_path(unity_instance)
-                # Pass project path for multi-instance support
-                nudged = await nudge_unity_focus(unity_project_path=project_path)
-                if nudged:
+                logger.info(
+                    f"Test job {job_id} appears stalled (unfocused Unity), attempting nudge...")
+                if project_path_box["value"] is None:
+                    project_path_box["value"] = await _get_unity_project_path(unity_instance)
+                if await nudge_unity_focus(unity_project_path=project_path_box["value"]):
                     logger.info(f"Test job {job_id} nudge completed")
 
-            # Check timeout
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                # Timeout reached, return current status
-                return GetTestJobResponse(**response)
+        response = await wait_for_async_job(
+            fetch_status=_fetch_status,
+            timeout_seconds=wait_timeout,
+            is_terminal=_is_terminal,
+            initial_interval=2.0,
+            max_interval=2.0,  # preserve historical fixed 2s cadence
+            on_each_response=_on_each_response,
+        )
 
-            # Wait before next poll (but don't exceed remaining time)
-            await asyncio.sleep(min(poll_interval, remaining))
-    
+        if not isinstance(response, dict):
+            return MCPResponse(success=False, error=str(response))
+        if not response.get("success", True):
+            return MCPResponse(**response)
+        return GetTestJobResponse(**response)
+
     # No wait_timeout - return immediately (original behavior)
     response = await _fetch_status()
     if not isinstance(response, dict):
