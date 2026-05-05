@@ -56,7 +56,7 @@ namespace MCPForUnity.Editor.Tools
             bool isAsync = @params.Value<bool?>("async") ?? false;
             if (isAsync)
             {
-                return HandleAsyncSubmit(@params, commandsToken);
+                return await HandleAsyncSubmit(@params, commandsToken).ConfigureAwait(true);
             }
 
             // --- Legacy synchronous path (unchanged) ---
@@ -280,7 +280,7 @@ namespace MCPForUnity.Editor.Tools
         /// Handle async batch submission. Queues commands via CommandGateway and returns
         /// a ticket (for non-instant batches) or results inline (for instant batches).
         /// </summary>
-        private static object HandleAsyncSubmit(JObject @params, JArray commandsToken)
+        private static async Task<object> HandleAsyncSubmit(JObject @params, JArray commandsToken)
         {
             bool atomic = @params.Value<bool?>("atomic") ?? false;
             bool failFast = @params.Value<bool?>("fail_fast") ?? @params.Value<bool?>("failFast") ?? false;
@@ -319,8 +319,8 @@ namespace MCPForUnity.Editor.Tools
                 {
                     try
                     {
-                        var result = CommandRegistry.InvokeCommandAsync(cmd.Tool, cmd.Params)
-                            .ConfigureAwait(true).GetAwaiter().GetResult();
+                        var result = await CommandRegistry.InvokeCommandAsync(cmd.Tool, cmd.Params)
+                            .ConfigureAwait(true);
                         job.Results.Add(result);
 
                         // fail_fast: stop on first failure result
