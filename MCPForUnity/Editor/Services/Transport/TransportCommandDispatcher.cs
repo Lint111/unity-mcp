@@ -79,6 +79,12 @@ namespace MCPForUnity.Editor.Services.Transport
         private static readonly TimeSpan DedupTtl = TimeSpan.FromSeconds(60);
         private static bool updateHooked;
         private static bool initialised;
+        // Tracks whether the dispatcher currently holds an EditorReadyPump.Acquire.
+        // Held while Pending is non-empty so Unity keeps ticking at full speed, even
+        // when unfocused — otherwise queued commands sit in Pending until the user
+        // clicks back into the Editor (Application Idle Time / Interaction Mode
+        // throttle EditorApplication.update). Guarded by PendingLock.
+        private static bool _pumpHeld;
 
         static TransportCommandDispatcher()
         {
@@ -167,6 +173,7 @@ namespace MCPForUnity.Editor.Services.Transport
                 Pending[id] = pending;
                 if (contentHash != null)
                     ContentHashToPendingId[contentHash] = id;
+                AcquirePumpLocked();
             }
 
             // Proactively wake up the main thread execution loop. This improves responsiveness
@@ -540,6 +547,7 @@ namespace MCPForUnity.Editor.Services.Transport
                 {
                     CleanContentHash(id);
                     UnhookUpdateIfIdle();
+                    ReleasePumpIfIdleLocked();
                 }
             }
 
@@ -554,9 +562,43 @@ namespace MCPForUnity.Editor.Services.Transport
                 Pending.Remove(id);
                 CleanContentHash(id);
                 UnhookUpdateIfIdle();
+                ReleasePumpIfIdleLocked();
             }
 
             pending.Dispose();
+        }
+
+        // Must be called under PendingLock.
+        private static void AcquirePumpLocked()
+        {
+            if (_pumpHeld) return;
+            try
+            {
+                EditorReadyPump.Acquire("dispatcher");
+                _pumpHeld = true;
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[Dispatcher] EditorReadyPump.Acquire failed: {ex.Message}");
+            }
+        }
+
+        // Must be called under PendingLock.
+        private static void ReleasePumpIfIdleLocked()
+        {
+            if (!_pumpHeld || Pending.Count > 0) return;
+            try
+            {
+                EditorReadyPump.Release("dispatcher");
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[Dispatcher] EditorReadyPump.Release failed: {ex.Message}");
+            }
+            finally
+            {
+                _pumpHeld = false;
+            }
         }
 
         /// <summary>
