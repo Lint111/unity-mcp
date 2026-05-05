@@ -393,6 +393,10 @@ def _focus_app_windows(window_title: str) -> bool:
     try:
         # For Unity, we use a pattern match since the title varies
         if window_title == "Unity":
+            # SW_RESTORE (9) un-minimizes — but it also un-maximizes a maximized
+            # window back to its prior size, dropping Unity out of fullscreen for
+            # the user. Only call it when the window is actually minimized; in all
+            # other cases SetForegroundWindow alone is enough to bring it to front.
             script = '''
 Add-Type @"
 using System;
@@ -402,11 +406,15 @@ public class Win32 {
     public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
 }
 "@
 $unity = Get-Process | Where-Object {$_.MainWindowTitle -like "*Unity*"} | Select-Object -First 1
 if ($unity) {
-    [Win32]::ShowWindow($unity.MainWindowHandle, 9)
+    if ([Win32]::IsIconic($unity.MainWindowHandle)) {
+        [Win32]::ShowWindow($unity.MainWindowHandle, 9)
+    }
     [Win32]::SetForegroundWindow($unity.MainWindowHandle)
 }
 '''
@@ -422,11 +430,15 @@ public class Win32 {{
     public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
 }}
 "@
 $proc = Get-Process | Where-Object {{$_.MainWindowTitle -eq '{safe_title}'}} | Select-Object -First 1
 if ($proc) {{
-    [Win32]::ShowWindow($proc.MainWindowHandle, 9)
+    if ([Win32]::IsIconic($proc.MainWindowHandle)) {{
+        [Win32]::ShowWindow($proc.MainWindowHandle, 9)
+    }}
     [Win32]::SetForegroundWindow($proc.MainWindowHandle)
 }}
 '''
