@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Resources;
+using MCPForUnity.Runtime.Helpers;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -62,7 +63,7 @@ namespace MCPForUnity.Editor.Tools
         {
             try
             {
-                var allTypes = AppDomain.CurrentDomain.GetAssemblies()
+                var allTypes = UnityAssembliesCompat.GetLoadedAssemblies()
                     .Where(a => !a.IsDynamic)
                     .SelectMany(a =>
                     {

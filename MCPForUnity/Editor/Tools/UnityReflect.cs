@@ -7,6 +7,7 @@ using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Runtime.Helpers;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 
@@ -82,7 +83,7 @@ namespace MCPForUnity.Editor.Tools
                     return _assemblyTypeCache;
 
                 _assemblyTypeCache = new Dictionary<string, Type[]>();
-                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                foreach (var asm in UnityAssembliesCompat.GetLoadedAssemblies())
                 {
                     try
                     {
