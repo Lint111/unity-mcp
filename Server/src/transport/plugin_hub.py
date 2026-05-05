@@ -1022,6 +1022,10 @@ class PluginHub(WebSocketEndpoint):
             max_wait_s = max(0.0, min(max_wait_s, 20.0))
             if max_wait_s > 0:
                 deadline = time.monotonic() + max_wait_s
+                # Adaptive backoff: start at 50ms so a fast settle returns
+                # quickly, double up to 500ms cap so a slow Unity startup
+                # doesn't generate a ping every 100ms for the full 6s window.
+                sleep_s = 0.05
                 while time.monotonic() < deadline:
                     try:
                         probe = await cls.send_command(session_id, "ping", {})
@@ -1034,7 +1038,8 @@ class PluginHub(WebSocketEndpoint):
                             probe.get("result"), dict) else {}
                         if result.get("message") == "pong":
                             break
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(sleep_s)
+                    sleep_s = min(0.5, sleep_s * 2)
                 else:
                     # Not ready within the bounded window: return retry hint without sending.
                     return MCPResponse(
