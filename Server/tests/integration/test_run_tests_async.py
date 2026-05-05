@@ -114,3 +114,75 @@ async def test_get_test_job_forwards_job_id(monkeypatch):
     assert resp.success is True
     assert resp.data is not None
     assert resp.data.job_id == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_get_test_job_wait_timeout_returns_terminal(monkeypatch):
+    """wait_timeout polls until data.status is succeeded/failed/cancelled."""
+    from services.tools.run_tests import get_test_job
+    import services.tools.run_tests as mod
+
+    sequence = [
+        {"success": True, "data": {"job_id": "j", "status": "running",
+                                   "last_update_unix_ms": 1, "progress": {"editor_is_focused": True}}},
+        {"success": True, "data": {"job_id": "j", "status": "running",
+                                   "last_update_unix_ms": 2, "progress": {"editor_is_focused": True}}},
+        {"success": True, "data": {"job_id": "j", "status": "succeeded",
+                                   "last_update_unix_ms": 3, "progress": {"editor_is_focused": True}}},
+    ]
+    calls = {"n": 0}
+
+    async def fake_send(send_fn, unity_instance, command_type, params, **kwargs):
+        idx = min(calls["n"], len(sequence) - 1)
+        calls["n"] += 1
+        return sequence[idx]
+
+    monkeypatch.setattr(mod.unity_transport, "send_with_unity_instance", fake_send)
+    monkeypatch.setattr(mod, "_get_unity_project_path", AsyncMock_returning(None))
+
+    resp = await get_test_job(DummyContext(), job_id="j", wait_timeout=10)
+    assert resp.success is True
+    assert resp.data.status == "succeeded"
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_test_job_wait_timeout_returns_running_on_timeout(monkeypatch):
+    """When the deadline passes, the helper returns the last running snapshot."""
+    from services.tools.run_tests import get_test_job
+    import services.tools.run_tests as mod
+
+    async def fake_send(send_fn, unity_instance, command_type, params, **kwargs):
+        return {"success": True, "data": {"job_id": "j", "status": "running",
+                                          "last_update_unix_ms": 1,
+                                          "progress": {"editor_is_focused": True}}}
+
+    monkeypatch.setattr(mod.unity_transport, "send_with_unity_instance", fake_send)
+    monkeypatch.setattr(mod, "_get_unity_project_path", AsyncMock_returning(None))
+
+    resp = await get_test_job(DummyContext(), job_id="j", wait_timeout=1)
+    assert resp.success is True
+    assert resp.data.status == "running"
+
+
+@pytest.mark.asyncio
+async def test_get_test_job_wait_timeout_short_circuits_on_unsuccessful_response(monkeypatch):
+    """A non-success response (e.g., transport error wrapper) terminates the wait."""
+    from services.tools.run_tests import get_test_job
+    import services.tools.run_tests as mod
+
+    async def fake_send(send_fn, unity_instance, command_type, params, **kwargs):
+        return {"success": False, "error": "Unity disconnected"}
+
+    monkeypatch.setattr(mod.unity_transport, "send_with_unity_instance", fake_send)
+    monkeypatch.setattr(mod, "_get_unity_project_path", AsyncMock_returning(None))
+
+    resp = await get_test_job(DummyContext(), job_id="j", wait_timeout=10)
+    assert resp.success is False
+    assert "Unity disconnected" in (resp.error or "")
+
+
+def AsyncMock_returning(value):
+    async def _coro(*args, **kwargs):
+        return value
+    return _coro

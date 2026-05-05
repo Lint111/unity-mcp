@@ -21,6 +21,7 @@ from transport.legacy.unity_connection import (
 )
 from transport.plugin_hub import PluginHub
 from services.tools import get_unity_instance_from_context
+from services.tools._wait import wait_for_async_job
 from services.registry import get_registered_tools
 
 logger = logging.getLogger("mcp-for-unity-server")
@@ -197,40 +198,59 @@ class CustomToolService:
         poll_params["action"] = poll_action or "status"
 
         timeout = max_poll_seconds if max_poll_seconds > 0 else _MAX_POLL_SECONDS
-        deadline = time.time() + timeout
-        response = initial_response
 
-        while True:
-            status, poll_interval = self._interpret_status(response)
+        # If the very first response is already terminal, short-circuit before
+        # entering the wait loop (e.g., a tool that returned `success` directly).
+        first_status, first_interval = self._interpret_status(initial_response)
+        if first_status in ("complete", "error", "final"):
+            return self._normalize_response(initial_response)
 
-            if status in ("complete", "error", "final"):
-                return self._normalize_response(response)
-
-            if time.time() > deadline:
-                return MCPResponse(
-                    success=False,
-                    message=f"Timeout waiting for {tool_name} to complete",
-                    data=self._safe_response(response),
-                )
-
-            await asyncio.sleep(poll_interval)
-
+        # The C#-supplied poll hint on the kickoff seeds the helper's interval;
+        # subsequent doublings cap at 5.0s (matching the prior _interpret_status cap).
+        # First fetch in the helper is the initial status poll (since we already have
+        # initial_response above and it's pending).
+        async def _fetch_status() -> dict[str, object]:
             try:
-                response = await send_with_unity_instance(
+                resp = await send_with_unity_instance(
                     async_send_command_with_retry,
                     unity_instance,
                     tool_name,
                     poll_params,
                     user_id=user_id,
                 )
-            except Exception as exc:  # pragma: no cover - network/domain reload variability
+            except Exception as exc:
+                # Transient error (typically a domain reload tearing down the
+                # WebSocket mid-poll). Synthesize a pending response so the helper
+                # keeps waiting; the next loop iteration will retry the call.
                 logger.debug(f"Polling {tool_name} failed, will retry: {exc}")
-                # Back off modestly but stay responsive.
-                response = {
+                return {
                     "_mcp_status": "pending",
-                    "_mcp_poll_interval": min(max(poll_interval * 2, _DEFAULT_POLL_INTERVAL), 5.0),
                     "message": f"Retrying after transient error: {exc}",
                 }
+            return resp if resp is not None else {"_mcp_status": "pending"}
+
+        def _is_terminal(resp) -> bool:
+            status, _ = self._interpret_status(resp)
+            return status in ("complete", "error", "final")
+
+        response = await wait_for_async_job(
+            fetch_status=_fetch_status,
+            timeout_seconds=timeout,
+            is_terminal=_is_terminal,
+            initial_interval=first_interval,
+            max_interval=5.0,
+        )
+
+        # Helper returns the last fetched response unconditionally on timeout.
+        # Translate that back into the previous semantics: pending-on-return =
+        # the deadline passed.
+        if not _is_terminal(response):
+            return MCPResponse(
+                success=False,
+                message=f"Timeout waiting for {tool_name} to complete",
+                data=self._safe_response(response),
+            )
+        return self._normalize_response(response)
 
     def _interpret_status(self, response) -> tuple[str, float]:
         if response is None:
