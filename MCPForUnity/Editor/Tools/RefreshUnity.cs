@@ -47,6 +47,12 @@ namespace MCPForUnity.Editor.Tools
                 // import actually runs when the Editor is backgrounded.
                 EditorReadyPump.RequestPump("refresh-unity");
 
+                // Prior versions passed ForceSynchronousImport here to "ensure the refresh
+                // completes before returning, preventing stalls when Unity is backgrounded".
+                // EditorReadyPump.RequestPump above already keeps Unity ticking at full speed,
+                // so the sync flag was redundant — it just locked the editor UI for the
+                // duration of the refresh. Callers that need to block until idle pass
+                // wait_for_ready=true and the event-driven WaitForUnityReadyAsync below.
                 if (shouldRefresh)
                 {
                     if (string.Equals(scope, "scripts", StringComparison.OrdinalIgnoreCase))
@@ -56,7 +62,7 @@ namespace MCPForUnity.Editor.Tools
                     }
                     else
                     {
-                        AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate | ImportAssetOptions.ForceSynchronousImport);
+                        AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate);
                         refreshTriggered = true;
                     }
                 }
@@ -70,9 +76,8 @@ namespace MCPForUnity.Editor.Tools
                 if (string.Equals(scope, "all", StringComparison.OrdinalIgnoreCase) && !refreshTriggered)
                 {
                     // If the caller asked for "all" and we skipped refresh above (e.g., scripts-only path),
-                    // do a lightweight refresh now. Use ForceSynchronousImport to ensure the refresh
-                    // completes before returning, preventing stalls when Unity is backgrounded.
-                    AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                    // do a lightweight refresh now. No sync flag — see comment above.
+                    AssetDatabase.Refresh();
                     refreshTriggered = true;
                 }
             }
@@ -139,9 +144,9 @@ namespace MCPForUnity.Editor.Tools
             // (which can be tens of ms apart when the editor is backgrounded). The update
             // tick remains as a fallback for asset-import completion (which has no event)
             // and as the timeout watchdog.
-            Action update = null;
+            EditorApplication.CallbackFunction update = null;
             Action<object> onCompilationFinished = null;
-            Action onAfterAssemblyReload = null;
+            AssemblyReloadEvents.AssemblyReloadCallback onAfterAssemblyReload = null;
 
             void Cleanup()
             {

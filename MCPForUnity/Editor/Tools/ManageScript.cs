@@ -787,14 +787,7 @@ namespace MCPForUnity.Editor.Tools
                 if (immediate)
                 {
                     McpLog.Info($"[ManageScript] ApplyTextEdits: immediate refresh for '{relativePath}'");
-                    EditorReadyPump.RequestPump("manage-script-apply-edits");
-                    AssetDatabase.ImportAsset(
-                        relativePath,
-                        ImportAssetOptions.ForceSynchronousImport | ImportAssetOptions.ForceUpdate
-                    );
-#if UNITY_EDITOR
-                    UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
-#endif
+                    ManageScriptRefreshHelpers.RequestCompileForEdit(relativePath);
                 }
                 else
                 {
@@ -1704,7 +1697,7 @@ namespace MCPForUnity.Editor.Tools
                 if (immediate)
                 {
                     McpLog.Info($"[ManageScript] EditScript: immediate refresh for '{relativePath}'", always: false);
-                    ManageScriptRefreshHelpers.ImportAndRequestCompile(relativePath);
+                    ManageScriptRefreshHelpers.RequestCompileForEdit(relativePath);
                 }
                 else
                 {
@@ -3017,13 +3010,33 @@ namespace MCPForUnity.Editor.Tools
             RefreshDebounce.Schedule(sp, TimeSpan.FromMilliseconds(200));
         }
 
-        public static void ImportAndRequestCompile(string relPath, bool synchronous = true)
+        /// <summary>
+        /// Register a newly-created script with AssetDatabase and request a compile.
+        /// Use only for NEW files (CreateScript) — AssetDB needs ImportAsset to assign
+        /// a GUID so subsequent lookups work. For edits to an existing script, prefer
+        /// <see cref="RequestCompileForEdit"/>, which avoids the ImportAsset main-thread block.
+        /// Drops ForceSynchronousImport / ForceUpdate so AssetDB skips the dependency
+        /// cascade reimport.
+        /// </summary>
+        public static void ImportAndRequestCompile(string relPath)
         {
             var sp = SanitizeAssetsPath(relPath);
-            var opts = ImportAssetOptions.ForceUpdate;
-            if (synchronous) opts |= ImportAssetOptions.ForceSynchronousImport;
             EditorReadyPump.RequestPump("manage-script-import-compile");
-            AssetDatabase.ImportAsset(sp, opts);
+            AssetDatabase.ImportAsset(sp);
+#if UNITY_EDITOR
+            UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
+#endif
+        }
+
+        /// <summary>
+        /// Request a script compile for an EXISTING file that was just edited on disk.
+        /// Skips AssetDatabase.ImportAsset entirely — CompilationPipeline reads scripts
+        /// from disk and the post-compile domain reload resyncs AssetDB. Saves a
+        /// main-thread block that grows with project size.
+        /// </summary>
+        public static void RequestCompileForEdit(string relPath)
+        {
+            EditorReadyPump.RequestPump("manage-script-edit-compile");
 #if UNITY_EDITOR
             UnityEditor.Compilation.CompilationPipeline.RequestScriptCompilation();
 #endif
